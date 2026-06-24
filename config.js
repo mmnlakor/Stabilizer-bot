@@ -46,6 +46,7 @@ const config = {
     USDT: requireAddress("USDT_ADDRESS"),
     USDS: requireAddress("USDS_ADDRESS"),
     USDZ: requireAddress("USDZ_ADDRESS"),
+    PYUSD: requireAddress("PYUSD_ADDRESS"),
   },
 
   swapPercent: requireNumber("SWAP_PERCENT", { min: 0.01, max: 100 }),
