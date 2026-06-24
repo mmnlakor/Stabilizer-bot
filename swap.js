@@ -1,12 +1,16 @@
 // ============================================================
 // swap.js
-// Core swap execution logic:
-//   1. Pick a random (sellToken, buyToken) pair
-//   2. Read on-chain balance + decimals for the sell token
-//   3. Compute swap amount = SWAP_PERCENT% of balance
-//   4. Approve router if current allowance is insufficient
-//   5. Compute a safe minimum output and call swap()
-//   6. Retry transient failures with backoff
+// Core swap execution logic.
+//
+// Each cycle now does TWO swaps:
+//   1. Forward: A -> B  (50% of A's current balance)
+//   2. Random delay (2-10 min)
+//   3. Return:  B -> A  (exact amount received from forward swap)
+//   4. Random delay (2-10 min)  <- handled by index.js after return
+//
+// Then index.js picks a fresh random pair for the next cycle.
+//
+// PYUSD added as 5th token alongside USDC, USDT, USDS, USDZ.
 // ============================================================
 
 const { ethers } = require("ethers");
@@ -35,8 +39,7 @@ function pickRandomPair() {
   return { sellToken, buyToken };
 }
 
-// Wraps a contract call with retry + backoff for transient errors
-// (RPC hiccups, nonce timing, temporary network issues).
+// Wraps a contract call with retry + backoff for transient errors.
 async function withRetry(label, fn) {
   let lastError;
   for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
@@ -144,61 +147,39 @@ class SwapBot {
       expected = sellAmountRaw / (10n ** BigInt(sellDecimals - buyDecimals));
     }
 
-    // Apply MIN_OUTPUT_PERCENT (e.g. 90 => 90%) using integer math.
-    const percentBasisPoints = BigInt(Math.round(config.minOutputPercent * 100)); // e.g. 9000
+    const percentBasisPoints = BigInt(Math.round(config.minOutputPercent * 100));
     return (expected * percentBasisPoints) / 10000n;
   }
 
-  async executeSwap() {
-    const { sellToken, buyToken } = pickRandomPair();
-    logger.cycle(`SWAP CYCLE: ${sellToken.symbol} -> ${buyToken.symbol}`);
+  // Executes a single on-chain swap. Returns the raw amount of buyToken
+  // actually received (derived from the ERC-20 Transfer event in the
+  // receipt), so the return swap can use the exact received amount.
+  async _sendSwap(sellToken, buyToken, sellAmountRaw) {
+    const humanAmount = ethers.formatUnits(sellAmountRaw, this.decimalsCache[sellToken.symbol]);
 
-    const rawBalance = await this.getRawBalance(sellToken.symbol);
-    const humanBalance = ethers.formatUnits(rawBalance, this.decimalsCache[sellToken.symbol]);
-
-    if (Number(humanBalance) < config.minBalanceThreshold) {
-      logger.warn(
-        `${sellToken.symbol} balance (${humanBalance}) is below MIN_BALANCE_THRESHOLD ` +
-        `(${config.minBalanceThreshold}). Skipping this cycle.`
-      );
-      return { skipped: true, reason: "insufficient_balance" };
-    }
-
-    // swapAmount = SWAP_PERCENT% of current balance, in raw token units.
-    const percentBasisPoints = BigInt(Math.round(config.swapPercent * 100)); // e.g. 2500 for 25%
-    const swapAmountRaw = (rawBalance * percentBasisPoints) / 10000n;
-
-    if (swapAmountRaw === 0n) {
-      logger.warn(`Computed swap amount is 0 for ${sellToken.symbol}. Skipping this cycle.`);
-      return { skipped: true, reason: "zero_amount" };
-    }
-
-    const humanAmount = ethers.formatUnits(swapAmountRaw, this.decimalsCache[sellToken.symbol]);
     logger.info(
-      `Swapping ${humanAmount} ${sellToken.symbol} -> ${buyToken.symbol} ` +
-      `(${config.swapPercent}% of balance ${humanBalance})`
+      `Swapping ${humanAmount} ${sellToken.symbol} -> ${buyToken.symbol}`
     );
 
-    // Step 1: Approval
-    await this.ensureApproval(sellToken.symbol, swapAmountRaw);
+    // Approval
+    await this.ensureApproval(sellToken.symbol, sellAmountRaw);
 
-    // Step 2: Compute minimum acceptable output
+    // Minimum acceptable output (slippage guard)
     const minOutputRaw = this.computeMinOutput(
-      swapAmountRaw,
+      sellAmountRaw,
       sellToken.symbol,
       buyToken.symbol
     );
     logger.info(
-      `Minimum acceptable output: ${ethers.formatUnits(minOutputRaw, this.decimalsCache[buyToken.symbol])} ${buyToken.symbol} ` +
-      `(${config.minOutputPercent}% of naive 1:1 expectation)`
+      `Min acceptable output: ${ethers.formatUnits(minOutputRaw, this.decimalsCache[buyToken.symbol])} ${buyToken.symbol}`
     );
 
-    // Step 3: Estimate gas, then send swap()
+    // Estimate gas + send
     const tx = await withRetry(`${sellToken.symbol}->${buyToken.symbol} swap()`, async () => {
       const estimatedGas = await this.router.swap.estimateGas(
         sellToken.address,
         buyToken.address,
-        swapAmountRaw,
+        sellAmountRaw,
         minOutputRaw
       );
       const gasLimit =
@@ -207,7 +188,7 @@ class SwapBot {
       return this.router.swap(
         sellToken.address,
         buyToken.address,
-        swapAmountRaw,
+        sellAmountRaw,
         minOutputRaw,
         { gasLimit }
       );
@@ -220,13 +201,119 @@ class SwapBot {
       throw new Error(`Swap transaction reverted on-chain. Tx: ${tx.hash}`);
     }
 
+    // Derive the exact amount of buyToken received by parsing the
+    // ERC-20 Transfer events in the receipt. We look for a Transfer
+    // TO our wallet address of the buyToken contract.
+    const buyTokenAddress = buyToken.address.toLowerCase();
+    const walletAddress = this.wallet.address.toLowerCase();
+    const transferTopic = ethers.id("Transfer(address,address,uint256)");
+
+    let receivedRaw = 0n;
+    for (const log of receipt.logs) {
+      if (
+        log.address.toLowerCase() === buyTokenAddress &&
+        log.topics[0] === transferTopic &&
+        log.topics.length === 3
+      ) {
+        const to = "0x" + log.topics[2].slice(26);
+        if (to.toLowerCase() === walletAddress) {
+          receivedRaw = BigInt(log.data);
+          break;
+        }
+      }
+    }
+
+    const humanReceived = ethers.formatUnits(receivedRaw, this.decimalsCache[buyToken.symbol]);
     logger.success(
       `Swap confirmed in block ${receipt.blockNumber}. ` +
-      `${humanAmount} ${sellToken.symbol} -> ${buyToken.symbol}. ` +
+      `Sent ${humanAmount} ${sellToken.symbol}, received ${humanReceived} ${buyToken.symbol}. ` +
       `Gas used: ${receipt.gasUsed.toString()}`
     );
 
-    return { skipped: false, txHash: tx.hash };
+    return { txHash: tx.hash, receivedRaw, humanReceived };
+  }
+
+  // One full swap cycle:
+  //   1. Pick random pair A -> B
+  //   2. Swap 50% of A's balance -> B
+  //   3. Wait random delay
+  //   4. Swap exact received amount back B -> A
+  //
+  // The delay after the return swap is handled by index.js,
+  // consistent with how the original bot was structured.
+  async executeSwap() {
+    const { sellToken, buyToken } = pickRandomPair();
+    logger.cycle(`SWAP CYCLE: ${sellToken.symbol} <-> ${buyToken.symbol}`);
+
+    // ── FORWARD SWAP: A -> B ──────────────────────────────────
+    const rawBalance = await this.getRawBalance(sellToken.symbol);
+    const humanBalance = ethers.formatUnits(rawBalance, this.decimalsCache[sellToken.symbol]);
+
+    if (Number(humanBalance) < config.minBalanceThreshold) {
+      logger.warn(
+        `${sellToken.symbol} balance (${humanBalance}) is below MIN_BALANCE_THRESHOLD ` +
+        `(${config.minBalanceThreshold}). Skipping this cycle.`
+      );
+      return { skipped: true, reason: "insufficient_balance" };
+    }
+
+    // 50% of current balance
+    const percentBasisPoints = BigInt(Math.round(config.swapPercent * 100)); // 5000 for 50%
+    const forwardAmountRaw = (rawBalance * percentBasisPoints) / 10000n;
+
+    if (forwardAmountRaw === 0n) {
+      logger.warn(`Computed swap amount is 0 for ${sellToken.symbol}. Skipping this cycle.`);
+      return { skipped: true, reason: "zero_amount" };
+    }
+
+    logger.info(
+      `Forward swap: ${config.swapPercent}% of ${humanBalance} ${sellToken.symbol} ` +
+      `= ${ethers.formatUnits(forwardAmountRaw, this.decimalsCache[sellToken.symbol])} ${sellToken.symbol}`
+    );
+
+    const forward = await this._sendSwap(sellToken, buyToken, forwardAmountRaw);
+
+    // ── INTER-SWAP DELAY ──────────────────────────────────────
+    if (forward.receivedRaw === 0n) {
+      logger.warn(
+        `Could not determine exact amount received from forward swap ` +
+        `(Transfer event not found in receipt). Skipping return swap to avoid sending wrong amount.`
+      );
+      return { skipped: false, txHash: forward.txHash, returnSkipped: true };
+    }
+
+    const interDelay = randomInt(config.minDelaySeconds, config.maxDelaySeconds);
+    logger.info(
+      `Forward swap complete. Waiting ${interDelay}s before return swap...`
+    );
+    await sleep(interDelay * 1000);
+
+    // ── RETURN SWAP: B -> A (exact amount received) ───────────
+    logger.cycle(`RETURN SWAP: ${buyToken.symbol} -> ${sellToken.symbol}`);
+    logger.info(
+      `Returning exact received amount: ${forward.humanReceived} ${buyToken.symbol} -> ${sellToken.symbol}`
+    );
+
+    // Verify we still have enough of buyToken to return
+    // (edge case: another process or tx may have spent it)
+    const buyTokenBalance = await this.getRawBalance(buyToken.symbol);
+    if (buyTokenBalance < forward.receivedRaw) {
+      logger.warn(
+        `${buyToken.symbol} balance (${ethers.formatUnits(buyTokenBalance, this.decimalsCache[buyToken.symbol])}) ` +
+        `is less than expected return amount (${forward.humanReceived}). ` +
+        `Using available balance instead.`
+      );
+      // Use what's actually available rather than failing
+      forward.receivedRaw = buyTokenBalance;
+    }
+
+    const returnSwap = await this._sendSwap(buyToken, sellToken, forward.receivedRaw);
+
+    return {
+      skipped: false,
+      forwardTxHash: forward.txHash,
+      returnTxHash: returnSwap.txHash,
+    };
   }
 }
 
